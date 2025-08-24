@@ -1,0 +1,2 @@
+# Ignore large dataset files
+dataset/*.parquet
