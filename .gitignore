@@ -1,2 +1,12 @@
+# Python virtual environment
+venv/
+
 # Ignore large dataset files
-dataset/*.parquetvenv/
+dataset/*.parquet
+dataset/*.csv
+
+# Python cache
+__pycache__/
+
+# Saved ML models
+models/*.joblib
