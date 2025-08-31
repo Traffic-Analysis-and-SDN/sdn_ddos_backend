@@ -1,2 +1,2 @@
 # Ignore large dataset files
-dataset/*.parquet
+dataset/*.parquetvenv/
