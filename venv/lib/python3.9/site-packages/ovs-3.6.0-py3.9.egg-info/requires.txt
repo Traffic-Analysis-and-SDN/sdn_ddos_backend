@@ -1,0 +1,18 @@
+sortedcontainers
+
+[:sys_platform == "win32"]
+pywin32>=1.0
+
+[dns]
+unbound
+
+[flow]
+netaddr
+pyparsing
+
+[flowviz]
+netaddr
+pyparsing
+click
+rich
+graphviz
