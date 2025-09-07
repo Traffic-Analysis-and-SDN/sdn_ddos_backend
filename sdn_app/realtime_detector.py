@@ -1,42 +1,41 @@
 """
-An advanced SDN application for real-time DDoS detection using a 
-two-stage hybrid algorithm.
-
-Stage 1: A specialized Machine Learning model (Random Forest) provides a fast
-         initial classification for each network flow.
-Stage 2: A stateful, heuristic supervisor analyzes the ML model's output and
-         confidence, using an adaptive threshold to confirm volumetric attacks
-         like SYN floods, thereby reducing false positives and enabling robust
-         detection.
+Final Project Code: An advanced SDN application for real-time DDoS detection 
+with a two-stage hybrid algorithm and a WebSocket API for frontend integration.
 """
-# Import necessary Ryu libraries
+# Import necessary Ryu and standard libraries
 from ryu.base import app_manager
 from ryu.controller import ofp_event
-from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
-from ryu.controller.handler import set_ev_cls
+from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet, ethernet, ipv4, tcp, udp
 from ryu.lib import hub
 
-# Import standard Python libraries
 import time
 import joblib
 import numpy as np
 import os
-
-# Just after the existing imports at the top of the file
-
-# --- CORRECTED CODE BLOCK ---
 import warnings
-# InconsistentVersionWarning is specific to scikit-learn
 from sklearn.exceptions import InconsistentVersionWarning
 
-# UserWarning is a built-in Python warning, so it does not need to be imported.
+# --- API & WEB SERVER IMPORTS ---
+from flask import Flask, jsonify, request
+from flask_socketio import SocketIO
+from flask_cors import CORS
+import threading
+from threading import Lock
+import eventlet
+# --------------------------------
 
-# Suppress specific warnings from scikit-learn for a cleaner log
+# Suppress scikit-learn warnings for a cleaner log
 warnings.filterwarnings("ignore", category=UserWarning, module='sklearn')
 warnings.filterwarnings("ignore", category=InconsistentVersionWarning, module='sklearn')
-# --------------------------
+
+# --- FLASK & SOCKET.IO GLOBAL SETUP ---
+flask_app = Flask(__name__)
+CORS(flask_app)
+socketio = SocketIO(flask_app, cors_allowed_origins="*", async_mode='eventlet')
+eventlet.monkey_patch()
+# ------------------------------------
 
 class RealtimeDetector(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -45,29 +44,56 @@ class RealtimeDetector(app_manager.RyuApp):
         super(RealtimeDetector, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
         self.flow_table = {}
-        
-        # --- HYBRID ALGORITHM DATA STRUCTURE ---
-        # This tracks potential victims based on suspicious flow counts.
-        # Key: (victim_ip, victim_port), Value: {'count': count, 'last_seen': timestamp}
         self.victim_tracker = {}
-        # -------------------------------------
-
+        self.active_mitigations = {}
+        self.api_lock = Lock()
         self.logger.info("SDN DDoS Detector Application Started.")
         
-        # --- LOAD THE SPECIALIZED ML MODEL ---
+        # Load the ML Model
         model_path = 'models/syn_flood_model.joblib'
-        if os.path.exists(model_path):
-            try:
-                self.model = joblib.load(model_path)
-                self.logger.info("ML Model loaded successfully from %s", model_path)
-            except Exception as e:
-                self.logger.error("Failed to load ML model: %s", e)
-                self.model = None
-        else:
-            self.logger.warning("ML model not found at %s. Running in monitoring mode only.", model_path)
-            self.model = None
+        self.model = joblib.load(model_path) if os.path.exists(model_path) else None
+        if self.model: self.logger.info("ML Model loaded successfully from %s", model_path)
+        else: self.logger.warning("ML model not found at %s. Running in monitoring mode only.", model_path)
+        
+        self.flask_thread = threading.Thread(target=self._run_flask_app)
+        self.flask_thread.daemon = True
+        self.flask_thread.start()
         
         self.monitor_thread = hub.spawn(self._monitor)
+
+    def _run_flask_app(self):
+        @flask_app.route('/api/flows', methods=['GET'])
+        def get_active_flows():
+            with self.api_lock:
+                flow_list = []
+                for flow_key, flow_stats in self.flow_table.items():
+                    flow_obj = {
+                        "sourceIp": flow_key[0], "destinationIp": flow_key[1], "protocol": flow_key[2],
+                        "sourcePort": flow_key[3] if len(flow_key) > 3 else 'N/A',
+                        "destinationPort": flow_key[4] if len(flow_key) > 4 else 'N/A',
+                        "status": flow_stats.get('status', 'active'),
+                        "packetCount": flow_stats.get('fwd_packet_count', 0)
+                    }
+                    flow_list.append(flow_obj)
+                
+                page = request.args.get('page', 1, type=int)
+                limit = request.args.get('limit', 50, type=int)
+                start = (page - 1) * limit
+                end = start + limit
+                paginated_flows = flow_list[start:end]
+                
+                return jsonify({
+                    'totalPages': (len(flow_list) + limit - 1) // limit,
+                    'currentPage': page, 'flows': paginated_flows
+                })
+
+        @flask_app.route('/api/mitigations', methods=['GET'])
+        def get_active_mitigations():
+            with self.api_lock:
+                return jsonify(list(self.active_mitigations.values()))
+        
+        self.logger.info("Starting Flask API server on http://0.0.0.0:5000")
+        socketio.run(flask_app, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -83,16 +109,9 @@ class RealtimeDetector(app_manager.RyuApp):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-        mod_args = {
-            'datapath': datapath,
-            'priority': priority,
-            'match': match,
-            'instructions': inst,
-            'idle_timeout': idle_timeout,
-            'hard_timeout': hard_timeout
-        }
-        if buffer_id:
-            mod_args['buffer_id'] = buffer_id
+        mod_args = {'datapath': datapath, 'priority': priority, 'match': match,
+                    'instructions': inst, 'idle_timeout': idle_timeout, 'hard_timeout': hard_timeout}
+        if buffer_id: mod_args['buffer_id'] = buffer_id
         mod = parser.OFPFlowMod(**mod_args)
         datapath.send_msg(mod)
 
@@ -103,33 +122,19 @@ class RealtimeDetector(app_manager.RyuApp):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         in_port = msg.match['in_port']
-
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
         
-        # --- L2 Learning Switch Logic ---
-        # learns mac address to avoid FLOOD next time.
         self.mac_to_port.setdefault(datapath.id, {})
         self.mac_to_port[datapath.id][eth.src] = in_port
-        
-        if eth.dst in self.mac_to_port[datapath.id]:
-            out_port = self.mac_to_port[datapath.id][eth.dst]
-        else:
-            out_port = ofproto.OFPP_FLOOD
+        out_port = self.mac_to_port[datapath.id].get(eth.dst, ofproto.OFPP_FLOOD)
         actions = [parser.OFPActionOutput(out_port)]
 
-        # --- BLOCK REMOVED ---
-        # The code that installed a proactive flow rule was here.
-        # It has been removed to ensure the controller sees more packets
-        # from each flow for better analysis, at the cost of higher CPU load.
+        with self.api_lock:
+            ip = pkt.get_protocol(ipv4.ipv4)
+            if ip:
+                self._update_flow_stats(datapath, ip, pkt, len(msg.data))
         
-        # --- Real-time Feature Extraction Logic ---
-        ip = pkt.get_protocol(ipv4.ipv4)
-        if ip:
-            self._update_flow_stats(datapath, ip, pkt, len(msg.data))
-        
-        # --- Forward the Packet ---
-        # Instruct the switch to send this specific packet out.
         data = msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
                                   in_port=in_port, actions=actions, data=data)
@@ -139,10 +144,10 @@ class RealtimeDetector(app_manager.RyuApp):
         src_ip, dst_ip, protocol = ip.src, ip.dst, ip.proto
         flow_key = (src_ip, dst_ip, protocol)
         
-        if protocol == 6: # TCP
+        if protocol == 6:
             t = pkt.get_protocol(tcp.tcp)
             if t: flow_key = (src_ip, dst_ip, protocol, t.src_port, t.dst_port)
-        elif protocol == 17: # UDP
+        elif protocol == 17:
             u = pkt.get_protocol(udp.udp)
             if u: flow_key = (src_ip, dst_ip, protocol, u.src_port, u.dst_port)
 
@@ -150,9 +155,9 @@ class RealtimeDetector(app_manager.RyuApp):
         
         if flow_key not in self.flow_table:
             self.flow_table[flow_key] = {
-                'datapath': datapath, 'fwd_packet_count': 1, 'fwd_byte_count': packet_length,
-                'start_time': current_time, 'last_seen_time': current_time,
-                'syn_flag_count': 0, 'fin_flag_count': 0,
+                'status': 'active', 'datapath': datapath, 'fwd_packet_count': 1, 
+                'fwd_byte_count': packet_length, 'start_time': current_time, 
+                'last_seen_time': current_time, 'syn_flag_count': 0, 'fin_flag_count': 0,
             }
         else:
             self.flow_table[flow_key]['fwd_packet_count'] += 1
@@ -165,111 +170,119 @@ class RealtimeDetector(app_manager.RyuApp):
             if t.bits & 0x01: self.flow_table[flow_key]['fin_flag_count'] += 1
 
     def _monitor(self):
-        """Background thread to monitor flows, provide status, and check for timeouts."""
         while True:
-            # Provide a periodic status update of currently active flows
-            self.logger.info("Monitoring... Currently tracking %d active flows.", len(self.flow_table))
-            
-            # --- NEW: Collect all timed-out flows first ---
-            timed_out_flows = []
-            for flow_key, flow_stats in list(self.flow_table.items()):
-                if time.time() - flow_stats['last_seen_time'] > 10: # Flow timeout = 10s
-                    timed_out_flows.append((flow_key, flow_stats))
-
-            # --- NEW: Implement Smart Logging ---
-            # If a large number of flows time out at once, it's likely a flood.
-            # In this case, print a summary instead of logging each one individually.
-            LOGGING_THRESHOLD = 10 
-            if len(timed_out_flows) > LOGGING_THRESHOLD:
-                self.logger.warning("[ATTACK BEHAVIOR] %d flows timed out simultaneously. Processing...", len(timed_out_flows))
-
-            # Now, process all the timed-out flows for detection
-            for flow_key, flow_stats in timed_out_flows:
-                # Use detailed logging only if we are below the threshold
-                if len(timed_out_flows) <= LOGGING_THRESHOLD:
-                    self.logger.info("Flow timed out: %s", flow_key)
+            with self.api_lock:
+                stats = {'activeFlows': len(self.flow_table), 'mitigationCount': len(self.active_mitigations)}
+                socketio.emit('updateStats', stats)
                 
-                # The core detection logic remains the same
-                feature_vector = self._calculate_features(flow_key, flow_stats)
-                datapath = flow_stats.get('datapath')
-                if datapath:
-                    self._predict_and_mitigate(datapath, flow_key, feature_vector)
+                timed_out_flows = []
+                for flow_key, flow_stats in self.flow_table.items():
+                    if time.time() - flow_stats['last_seen_time'] > 10 and flow_stats.get('status', 'active') == 'active':
+                        timed_out_flows.append((flow_key, flow_stats))
 
-                # Remove the processed flow from the main table
-                del self.flow_table[flow_key]
+                for src_ip, mitigation_data in list(self.active_mitigations.items()):
+                    if time.time() - mitigation_data['timestamp'] > 60:
+                        del self.active_mitigations[src_ip]
+                        socketio.emit('mitigationRemoved', {'sourceIp': src_ip})
+                
+                for flow_key, flow_stats in list(self.flow_table.items()):
+                    if flow_stats.get('status') == 'analyzed' and time.time() - flow_stats.get('analysis_time', 0) > 30:
+                        del self.flow_table[flow_key]
+
+            if timed_out_flows:
+                if len(timed_out_flows) > 10: self.logger.warning("[ATTACK BEHAVIOR] %d flows timed out. Processing...", len(timed_out_flows))
+                
+                for flow_key, flow_stats in timed_out_flows:
+                    feature_vector = self._calculate_features(flow_key, flow_stats)
+                    datapath = flow_stats.get('datapath')
+                    if datapath:
+                        self._predict_and_mitigate(datapath, flow_key, feature_vector)
+                    
+                    with self.api_lock:
+                        if flow_key in self.flow_table:
+                             self.flow_table[flow_key]['status'] = 'analyzed'
+                             self.flow_table[flow_key]['analysis_time'] = time.time()
             
-            # Periodically clean up old victim tracker entries
-            for victim_key, victim_data in list(self.victim_tracker.items()):
-                if time.time() - victim_data['last_seen'] > 60: # Cleanup after 1 min
-                    del self.victim_tracker[victim_key]
+            with self.api_lock:
+                for victim_key, victim_data in list(self.victim_tracker.items()):
+                    if time.time() - victim_data['last_seen'] > 20:
+                        del self.victim_tracker[victim_key]
             
             hub.sleep(5)
 
     def _calculate_features(self, flow_key, flow_stats):
         flow_duration = flow_stats['last_seen_time'] - flow_stats['start_time']
-        flow_duration = max(flow_duration, 1e-6) # Avoid division by zero
-        
         return {
-            'Protocol': flow_key[2],
-            'Flow Duration': flow_duration,
-            'Total Fwd Packets': flow_stats['fwd_packet_count'],
-            'Total Backward Packets': 0, # Placeholder
-            'Fwd IAT Total': flow_duration, # Simplified
+            'Protocol': flow_key[2], 'Flow Duration': max(flow_duration, 1e-6),
+            'Total Fwd Packets': flow_stats['fwd_packet_count'], 'Total Backward Packets': 0,
+            'Fwd IAT Total': max(flow_duration, 1e-6),
             'Packet Length Mean': flow_stats['fwd_byte_count'] / flow_stats['fwd_packet_count'],
-            'FIN Flag Count': flow_stats['fin_flag_count'],
-            'SYN Flag Count': flow_stats['syn_flag_count']
+            'FIN Flag Count': flow_stats['fin_flag_count'], 'SYN Flag Count': flow_stats['syn_flag_count']
         }
 
     def _predict_and_mitigate(self, datapath, flow_key, features):
         if self.model is None: return
 
         try:
-            # --- STAGE 1: ML PREDICTION ---
-            feature_order = ['Protocol', 'Flow Duration', 'Total Fwd Packets',
-                             'Total Backward Packets', 'Fwd IAT Total',
-                             'Packet Length Mean', 'FIN Flag Count', 'SYN Flag Count']
+            feature_order = ['Protocol', 'Flow Duration', 'Total Fwd Packets', 'Total Backward Packets',
+                             'Fwd IAT Total', 'Packet Length Mean', 'FIN Flag Count', 'SYN Flag Count']
             feature_values = [features[feature] for feature in feature_order]
             live_traffic_features = np.array(feature_values).reshape(1, -1)
             
             prediction = self.model.predict(live_traffic_features)
-            confidence = self.model.predict_proba(live_traffic_features)[0]
+            confidence_scores = self.model.predict_proba(live_traffic_features)[0]
+            attack_confidence = float(confidence_scores[1])
+            
+            socketio.emit('updateConfidence', {'confidence': attack_confidence})
 
-            # --- STAGE 2: HYBRID ALGORITHM LOGIC ---
             is_suspicious = (features['Total Fwd Packets'] <= 5 and features['SYN Flag Count'] >= 1)
 
             if prediction[0] == 1 and is_suspicious:
-                # --- ADAPTIVE THRESHOLDING (The "AI Era" Upgrade) ---
-                attack_confidence = confidence[1] # Probability of being a DDoS attack
-                
-                if attack_confidence > 0.95:
-                    dynamic_flood_threshold = 20  # High confidence -> Be aggressive
-                elif attack_confidence > 0.75:
-                    dynamic_flood_threshold = 50  # Medium confidence -> Standard
-                else:
-                    dynamic_flood_threshold = 100 # Low confidence -> Be cautious
+                if attack_confidence > 0.95: dynamic_flood_threshold = 20
+                elif attack_confidence > 0.75: dynamic_flood_threshold = 50
+                else: dynamic_flood_threshold = 100
 
                 victim_key = (flow_key[1], flow_key[4] if len(flow_key) > 4 else 0)
                 
-                if victim_key not in self.victim_tracker:
-                    self.victim_tracker[victim_key] = {'count': 0, 'last_seen': time.time()}
+                with self.api_lock:
+                    if victim_key not in self.victim_tracker:
+                        self.victim_tracker[victim_key] = {'count': 0, 'last_seen': time.time()}
+                    self.victim_tracker[victim_key]['count'] += 1
+                    self.victim_tracker[victim_key]['last_seen'] = time.time()
+                    current_count = self.victim_tracker[victim_key]['count']
                 
-                self.victim_tracker[victim_key]['count'] += 1
-                self.victim_tracker[victim_key]['last_seen'] = time.time()
-
                 self.logger.info("Suspicious SYN flow to %s. Confidence: %.2f. Count: %d. Threshold: %d",
-                                 victim_key, attack_confidence, self.victim_tracker[victim_key]['count'], dynamic_flood_threshold)
+                                 victim_key, attack_confidence, current_count, dynamic_flood_threshold)
                 
-                if self.victim_tracker[victim_key]['count'] > dynamic_flood_threshold:
-                    self.logger.info("🚨 HYBRID DETECTION: DDoS Flood Confirmed against %s 🚨", victim_key)
-                    # For this project, we block the source of the triggering flow
+                if current_count > dynamic_flood_threshold:
                     src_ip = flow_key[0]
+                    victim_ip = victim_key[0]
+                    
+                    alert_data = {'type': 'DDoS ATTACK', 'severity': 'High', 'sourceIp': src_ip,
+                                  'destination': f"{victim_key[0]}:{victim_key[1]}",
+                                  'confidence': f"{attack_confidence:.2%}", 'timestamp': time.time()}
+                    socketio.emit('newAlert', alert_data)
+                    self.logger.info("🚨 HYBRID DETECTION: DDoS Flood Confirmed against %s 🚨", victim_key)
+                    
+                    ofproto = datapath.ofproto
                     parser = datapath.ofproto_parser
-                    match = parser.OFPMatch(eth_type=0x0800, ipv4_src=src_ip)
-                    actions = [] # Empty action list means DROP
-                    self.add_flow(datapath, priority=2, match=match, actions=actions, hard_timeout=60)
-                    self.logger.info("🛡️ MITIGATION ACTIVE: Blocking traffic from %s for 60 seconds", src_ip)
-                    # Reset counter to prevent log spam
-                    self.victim_tracker[victim_key]['count'] = 0
+                    match = parser.OFPMatch(eth_type=0x0800, ipv4_src=src_ip, ipv4_dst=victim_ip)
+                    actions = []
+                    self.add_flow(datapath, priority=ofproto.OFP_DEFAULT_PRIORITY + 10, match=match, actions=actions, hard_timeout=60)
+                    
+                    with self.api_lock:
+                        mitigation_data = {'sourceIp': src_ip, 'type': 'Block', 'status': 'Active', 
+                                           'timestamp': time.time(), 'victim': f"{victim_key[0]}:{victim_key[1]}"}
+                        self.active_mitigations[src_ip] = mitigation_data
+                        socketio.emit('newMitigation', mitigation_data)
+                        self.logger.info("🛡️ MITIGATION ACTIVE: Blocking traffic from %s to %s for 60 seconds", src_ip, victim_ip)
+                        self.victim_tracker[victim_key]['count'] = 0
+            
+            # --- FIX: THIS ELSE BLOCK WAS ACCIDENTALLY REMOVED. IT'S NOW RESTORED. ---
+            else:
+                # This block handles all non-suspicious or benign-predicted flows
+                benign_confidence = float(confidence_scores[0])
+                self.logger.info("✅ Flow Analyzed: Normal traffic. Confidence: %.2f", benign_confidence)
 
         except Exception as e:
             self.logger.error("Error in prediction/mitigation: %s", e)
